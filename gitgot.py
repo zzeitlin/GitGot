@@ -12,10 +12,16 @@ import sre_constants
 import os
 import os.path
 import urllib.parse
+import pathlib
 
 
 SIMILARITY_THRESHOLD = 65
-ACCESS_TOKEN = "<NO-PERMISSION-GITHUB-TOKEN-HERE>"
+TOKENFILE = str(pathlib.Path(__file__).parent.absolute()) + "/tokenfile"
+TOKENS = []
+with open(TOKENFILE, "r") as fd:
+  for line in fd.read().splitlines():
+    TOKENS.append(line)
+CURRENT_TOKEN = 0
 GITHUB_WHITESPACE = "\\.|,|:|;|/|\\\\|`|'|\"|=|\\*|!|\\?" \
                     "|\\#|\\$|\\&|\\+|\\^|\\||\\~|<|>|\\(" \
                     "|\\)|\\{|\\}|\\[|\\]| "
@@ -48,6 +54,7 @@ class State:
                  query=None,
                  logfile="",
                  is_gist=False,
+                 is_count=False,
                  ):
         self.bad_users = bad_users
         self.bad_repos = bad_repos
@@ -60,7 +67,20 @@ class State:
         self.query = query
         self.logfile = logfile
         self.is_gist = is_gist
+        self.is_count = is_count
 
+def increment_token():
+  global TOKENFILE
+  global TOKENS
+  global CURRENT_TOKEN
+  CURRENT_TOKEN = (CURRENT_TOKEN + 1)%len(TOKENS)
+  # Also rotate the tokenfile
+  with open(TOKENFILE, 'r') as myfile:
+    contents = myfile.read().splitlines()
+  firstline = contents[0]
+  remaininglines = contents[1:]
+  with open(TOKENFILE, 'w') as myfile:
+    myfile.write("\n".join(remaininglines)+"\n"+firstline)
 
 def save_state(name, state):
     filename = state.logfile.replace("log", "state")
@@ -148,7 +168,7 @@ def print_handler(contents):
     print(contents)
 
 
-def input_handler(state, is_gist):
+def input_handler(state, is_gist, repo):
     prompt = bcolors.HEADER + \
         "(Result {}/{})".format(
             state.index +
@@ -162,8 +182,12 @@ def input_handler(state, is_gist):
         bcolors.WARNING + "/[f]ilename"
     prompt += bcolors.HEADER + \
         ", [p]rint contents, [s]ave state, [a]dd to log, " + \
-        "search [/(findme)], [b]ack, [q]uit, next [<Enter>]===: " + \
-        bcolors.ENDC
+        "search [/(findme)], [b]ack, [q]uit, next [<Enter>]\n"
+
+    prompt += bcolors.OKGREEN + "user: " + repo.repository.owner.login + "\n"
+    prompt += bcolors.OKBLUE + "repo: " + repo.repository.name + "\n"
+    prompt += bcolors.WARNING + "filename: " + repo.name + "\n"
+    prompt += bcolors.HEADER + " > " + bcolors.ENDC
     return input(prompt)
 
 
@@ -189,17 +213,20 @@ def regex_handler(choice, repo):
 
 
 def ui_loop(repo, log_buf, state, is_gist=False):
-    choice = input_handler(state, is_gist)
+    choice = input_handler(state, is_gist, repo)
 
     if choice == "c":
         state.bad_signatures.append(ssdeep.hash(repo.decoded_content))
     elif choice == "u":
         state.bad_users.append(repo.owner.login if is_gist
                                else repo.repository.owner.login)
+        save_state(state.query, state)
     elif choice == "r" and not is_gist:
         state.bad_repos.append(repo.repository.name)
+        save_state(state.query, state)
     elif choice == "f" and not is_gist:
         state.bad_files.append(repo.name)
+        save_state(state.query, state)
     elif choice == "p":
         print_handler(repo.decoded_content)
         ui_loop(repo, log_buf, state, is_gist)
@@ -223,6 +250,8 @@ def ui_loop(repo, log_buf, state, is_gist=False):
         else:
             state.index -= 2
     elif choice == "q":
+        # auto save state
+        save_state(state.query, state)
         sys.exit(0)
 
 
@@ -258,6 +287,10 @@ def gist_search(g, state):
         print("No results found for query: {}".format(state.query))
     else:
         print(bcolors.CLEAR)
+        if state.is_count:
+          print("\nFOUND RESULTS: {}, QUERY: {}\n".format(state.totalCount,state.query))
+          return
+
 
     i = state.index
     stepBack = False
@@ -309,11 +342,19 @@ def gist_search(g, state):
 
 
 def github_search(g, state):
-    print("Collecting Github Search API data...")
+    #print("Collecting Github Search API data...")
     try:
         repositories = g.search_code(state.query)
 
         state.totalCount = repositories.totalCount
+        if state.totalCount == 0:
+          print("No results found for query: {}".format(state.query))
+          return
+        elif state.is_count:
+          print("\nFOUND RESULTS: {}, QUERY: {}\n".format(state.totalCount,state.query))
+          return
+          
+
 
         # Hack to backfill PaginatedList with garbage to avoid ratelimiting on
         # restore, library fetches in 30 counts
@@ -369,22 +410,34 @@ def github_search(g, state):
                     try:
                         print(
                             bcolors.FAIL +
-                            "RateLimitException: "
-                            "Please wait about 30 seconds before you "
-                            "try again, or exit (CTRL-C).\n " +
+                            "RateLimitException: Token has been incremented to the next token. Please try again, or exit (CTRL-C).\n " +
                             bcolors.ENDC)
-                        save_state("ratelimited", state)
+                        increment_token()
+                        if hasattr(g,"base_url"):
+                            old_g = g
+                            g = github.Github(base_url=old_g.base_url,
+                                              login_or_token=TOKENS[CURRENT_TOKEN])
+                        else:
+                            g = github.Github(TOKENS[CURRENT_TOKEN])
+
+                        #save_state("ratelimited", state)
                         input("Press enter to try again...")
                     except KeyboardInterrupt:
                         sys.exit(1)
     except github.RateLimitExceededException:
         print(
             bcolors.FAIL +
-            "RateLimitException: "
-            "Please wait about 30 seconds before you try again.\n" +
+            "RateLimitException: Token has been incremented to the next token. Please try again, or exit (CTRL-C).\n " +
             bcolors.ENDC)
-        save_state("ratelimited", state)
-        sys.exit(-1)
+        increment_token()
+        if hasattr(g,"base_url"):
+            old_g = g
+            g = github.Github(base_url=old_g.base_url,
+                              login_or_token=TOKENS[CURRENT_TOKEN])
+        else:
+            g = github.Github(TOKENS[CURRENT_TOKEN])
+        #save_state("ratelimited", state)
+        #sys.exit(-1)
 
 
 def regex_validator(args, state):
@@ -416,7 +469,8 @@ def regex_validator(args, state):
 
 
 def main():
-    global ACCESS_TOKEN
+    global TOKENS
+    global CURRENT_TOKEN
 
     if sys.version_info < (3, 0):
         sys.stdout.write("Sorry, requires Python 3.x, not Python 2.x\n")
@@ -460,15 +514,28 @@ def main():
         "--url",
         help="URL of self-hosted GitHub instance (e.g., https://git.example.com)",
         type=str)
+    parser.add_argument(
+        "-t",
+        "--token",
+        help="GitHub Access Token",
+        type=str)
+    parser.add_argument(
+        "-c",
+        "--count",
+        help="Only get a count of hits and return",
+        action='store_true',
+        required=False)
     args = parser.parse_args()
 
     state = State()
     state.index = 0
+    if TOKENS[CURRENT_TOKEN] == "<NO-PERMISSION-GITHUB-TOKEN-HERE>":
+        TOKENS[CURRENT_TOKEN] = os.environ.get("GITHUB_ACCESS_TOKEN", "")
 
-    if ACCESS_TOKEN == "<NO-PERMISSION-GITHUB-TOKEN-HERE>":
-        ACCESS_TOKEN = os.environ.get("GITHUB_ACCESS_TOKEN", "")
+    if args.token:
+      TOKENS[CURRENT_TOKEN] = args.token
 
-    if not ACCESS_TOKEN:
+    if not TOKENS[CURRENT_TOKEN]:
         print("Github Access token not set")
         sys.exit(1)
 
@@ -484,6 +551,7 @@ def main():
         state.index = 0
 
     state.is_gist = state.is_gist or (args.gist and not state.is_gist)
+    state.is_count = state.is_count or (args.count and not state.is_count)
 
     if args.output:
         state.logfile = args.output
@@ -504,9 +572,9 @@ def main():
 
     if args.url:
         g = github.Github(base_url=args.url + "/api/v3",
-                          login_or_token=ACCESS_TOKEN)
+                          login_or_token=TOKENS[CURRENT_TOKEN])
     else:
-        g = github.Github(ACCESS_TOKEN)
+        g = github.Github(TOKENS[CURRENT_TOKEN])
 
 
     if state.is_gist:
