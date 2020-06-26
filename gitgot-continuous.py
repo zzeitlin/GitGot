@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-
-
 import github
 import sys
 import time
@@ -12,6 +10,11 @@ import json
 
 # This thread takes in a file as input, and processes it.
 class Inquisitor(threading.Thread):
+	# Where to store logging information
+	LOGFILE = 'continuous/logs/log.txt'
+	# Number of seconds between git queries
+	DELAY = 7
+	
 	def __init__(self, callback=None, callback_args=None, *args, **kwargs):
 		#target = kwargs.pop('target')
 		target = self.processFile
@@ -25,6 +28,16 @@ class Inquisitor(threading.Thread):
 		self.token = token
 		self.g = github.Github(self.token)
 		self.callback_args = callback_args
+		
+		# Setup logging
+		self.logfh = logging.FileHandler(Inquisitor.LOGFILE)
+		self.logfh.setLevel(logging.DEBUG)
+		#self.formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+		self.formatter = logging.Formatter('{"datetime": "%(asctime)s", "name":"%(name)s", "result": %(message)s}')
+		self.logfh.setFormatter(self.formatter)
+		self.logger = logging.getLogger('namehere')
+		self.logger.setLevel(logging.DEBUG)
+		self.logger.addHandler(self.logfh)
 		
 	def target_with_callback(self):
 		self.method(self.filepath)
@@ -42,11 +55,12 @@ class Inquisitor(threading.Thread):
 					'totalCount': repositories.totalCount,
 					'query': query
 				}
-				print(json.dumps(result))
+				self.logger.info(json.dumps(result))
 			except github.RateLimitExceededException:
 				print("Rate Limit Exceeded on query")
-			time.sleep(7)
-		time.sleep(13)
+			
+			# Delay between queries
+			time.sleep(Inquisitor.DELAY)
 
 
 class InquisitorController():
