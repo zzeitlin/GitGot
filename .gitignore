@@ -3,3 +3,4 @@ states
 tokenfile
 checks/*.list
 __pycache__
+*.swp
