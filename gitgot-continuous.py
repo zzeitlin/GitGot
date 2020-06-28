@@ -11,8 +11,7 @@ import json
 # This thread takes in a file as input, and processes it.
 class Inquisitor(threading.Thread):
 	# Where to store logging information
-	QUERYLOG = 'continuous/logs/queries.txt'
-	OUTPUTDIR = 'continuous/output/'
+	OUTPUTDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),"continuous/output/")
 	# Number of seconds between git queries per thread
 	DELAY = 7
 	
@@ -24,7 +23,7 @@ class Inquisitor(threading.Thread):
 		tagDelimiter = kwargs.pop('tagDelimiter')
 		searchAugmentor = kwargs.pop('searchAugmentor')
 		searchParameters = kwargs.pop('searchParameters')
-		
+    
 		super(Inquisitor, self).__init__(target=self.target_with_callback, *args, **kwargs)
 		self.callback = callback
 		self.method = target
@@ -36,21 +35,13 @@ class Inquisitor(threading.Thread):
 		self.searchAugmentor = searchAugmentor
 		self.searchParameters = searchParameters
 
-		# Setup logging
-		self.logFormatter = logging.Formatter('{"datetime": "%(asctime)s", "name":"%(name)s", "result": %(message)s}')
-		
 		# Log for every query
-		self.querylogfh = logging.FileHandler(Inquisitor.QUERYLOG)
-		self.querylogfh.setLevel(logging.DEBUG)
-		self.querylogfh.setFormatter(self.logFormatter)
-		self.querylogger = logging.getLogger('inquisitor')
-		self.querylogger.setLevel(logging.DEBUG)
-		self.querylogger.addHandler(self.querylogfh)
-		
+		self.querylogger = logging.getLogger('queryLog')
+		# Log for main script
+		self.logger = logging.getLogger('main')
 		# Log for only hits
-		self.hitslogger = logging.getLogger('hits')
+		self.hitslogger = logging.getLogger('hits'+self.tagDelimiter)
 		self.hitslogger.setLevel(logging.DEBUG)
-		
 		
 	def target_with_callback(self):
 		self.method(self.filepath)
@@ -58,6 +49,7 @@ class Inquisitor(threading.Thread):
 			self.callback(*self.callback_args)
 	
 	def doQuery(self,query):  
+		self.logger.info("Inquisitor.doQuery: \"" + query + "\"")
 		try:
 			repositories = self.g.search_code(query)
 			numURLs = min(repositories.totalCount,5)
@@ -91,8 +83,7 @@ class Inquisitor(threading.Thread):
 			if(not os.path.isdir(outputDir)):
 				os.makedirs(outputDir, exist_ok=True)
 			hitlogfh = logging.FileHandler(os.path.join(outputDir,'hits.json'))
-			hitlogfh.setFormatter(self.logFormatter)
-			self.hitslogger.addHandler(hitlogfh)
+			hitlogfh.setFormatter(logging.Formatter('{"datetime": "%(asctime)s", "name":"%(name)s", "result": %(message)s}'))
 			
 			with open(filepath, "r") as fp:
 				subqueries = [line.rstrip() for line in fp.readlines()]
@@ -104,14 +95,15 @@ class Inquisitor(threading.Thread):
 						for subquery in subqueries:
 							for searchAugmentor in searchAugmentors:
 								query = subquery + " " + searchAugmentor + " " + searchParameters
-								print(query)
 								result = self.doQuery(query)
 								result['tag'] = tag
 								
 								# Log results 
 								self.querylogger.info(json.dumps(result))
 								if(result['totalCount'] > 0):
+									self.hitslogger.addHandler(hitlogfh)
 									self.hitslogger.info(json.dumps(result))
+									self.hitslogger.removeHandler(hitlogfh)
 								
 								# Delay between queries
 								time.sleep(Inquisitor.DELAY)
@@ -120,7 +112,6 @@ class Inquisitor(threading.Thread):
 				else:
 					for subquery in subqueries:
 						query = subquery + " " + searchParameters
-						print(query)
 						result = self.doQuery(query)
 						result['tag'] = tag
 						
@@ -132,9 +123,6 @@ class Inquisitor(threading.Thread):
 						# Delay between queries
 						time.sleep(Inquisitor.DELAY)
 							
-				# Remove log handlers
-				self.hitslogger.removeHandler(hitlogfh)
-				self.querylogger.removeHandler(self.querylogfh)
 
 
 class InquisitorController():
@@ -157,13 +145,13 @@ class InquisitorController():
 		self.tagDelimiter = tagDelimiter
 		self.searchAugmentor = searchAugmentor
 		self.searchParameters = searchParameters
+		self.logger = logging.getLogger('main')
 
 	def enqueue(self, filepath):
 		self.queue.append(filepath)
-		print("enqueue() called. curent queue: " + str(self.queue))
+		self.logger.info("InquisitorController.enqueue: Adding to file queue: " + filepath)
 		
 	def process(self):
-		#print ("process() called")
 		if len(self.queue) > 0 and self.threadCount < self.maxThreads:
 			fileToProcess = self.queue.pop(0)
 			self.threadCount += 1
@@ -179,12 +167,15 @@ class InquisitorController():
 				searchParameters=self.searchParameters
 			)
 			thread.start()
+			self.logger.info("InquisitorController.process: Processing: " + fileToProcess)
+			self.logger.info("InquisitorController.process: Current running threads: " + str(self.threadCount))
 			
 			# Increment to next token (round-robin)
 			self.currentTokenIndex = (self.currentTokenIndex + 1) % len(self.tokens)
 			
 	def dequeue(self, filepath):
 		print("dequeue called: "+str(filepath))
+		self.logger.info("InquisitorController.dequeue: Removing from file queue: " + filepath)
 		# Remove from queue
 		while filepath in self.queue:
 			self.queue.remove(filepath)
@@ -199,14 +190,37 @@ class InquisitorController():
 # Not using python watchdog as the Thread-calling mechanism above required object-passing to keep things synchronized.
 # This is simpler: a single loop.
 def main():
-	PATH_TO_WATCH = os.path.join(os.getcwd(),"continuous/ingester")
-	TOKENFILE = os.path.join(os.getcwd(),"tokenfile")
-	SEARCH_AUGMENTOR = os.path.join(os.getcwd(),"continuous/search_augmentor")
-	SEARCH_PARAMETERS = os.path.join(os.getcwd(),"continuous/search_parameters")
+	PATH_TO_WATCH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "continuous/ingester")
+	TOKENFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),"tokenfile")
+	SEARCH_AUGMENTOR = os.path.join(os.path.dirname(os.path.abspath(__file__)),"continuous/search_augmentor")
+	SEARCH_PARAMETERS = os.path.join(os.path.dirname(os.path.abspath(__file__)),"continuous/search_parameters")
+	LOGFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),"continuous/logs/out.log")
+	QUERYLOGFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),"continuous/logs/queries.log")
 	tokens = []
 	
+	# Setup Logging
+	mainLogFormatter = logging.Formatter('%(asctime)s: %(message)s')
+	queryLogFormatter = logging.Formatter('{"datetime": "%(asctime)s", "name":"%(name)s", "result": %(message)s}')
+
+	# Log for queriesy
+	querylogfh = logging.FileHandler(QUERYLOGFILE)
+	querylogfh.setFormatter(queryLogFormatter)
+	querylogger = logging.getLogger('queryLog')
+	querylogger.setLevel(logging.DEBUG)
+	querylogger.addHandler(querylogfh)
+
+	# Log for script
+	logfh = logging.FileHandler(LOGFILE)
+	logfh.setFormatter(mainLogFormatter)
+	logger = logging.getLogger('main')
+	logger.setLevel(logging.DEBUG)
+	logger.addHandler(logfh)
+
+	# Parse tokens
 	with open(TOKENFILE, "r") as fp:
 		tokens = [line.rstrip() for line in fp.readlines()]
+
+	# Create thread controller
 	controller = InquisitorController(
     tokens=tokens, 
     tagDelimiter=PATH_TO_WATCH, 
@@ -233,13 +247,13 @@ def main():
 			added = [f for f in after if not f in before]
 			removed = [f for f in before if not f in after]
 			if added:
+				logger.info("Directory monitor observed files created: " + ", ".join(added))
 				for f in added:
 					filepath = os.path.join(PATH_TO_WATCH,f)
 					if(os.path.isfile(filepath)):
 						controller.enqueue(filepath)
 			if removed: 
-				pass
-				#print("Removed: ", ", ".join (removed))
+				logger.info("Directory monitor observed files deleted: " + ", ".join(removed))
 			before = after
 			
 			# Process the queue
