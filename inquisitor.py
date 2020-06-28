@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+
+'''
+Author:		Zachary Zeitlin
+Purpose:	Continuously query GitHub for sensitive data and output search results.
+Notes:      - This file takes input from other relative filepaths, listed below.
+Usage:      ./gitgot-continuous.py
+'''
+
 import github
 import sys
 import time
@@ -6,6 +14,7 @@ import logging
 import threading
 import os
 import json
+import yaml
 
 
 # This thread takes in a file as input, and processes it.
@@ -13,14 +22,14 @@ class Inquisitor(threading.Thread):
 	# Where to store logging information
 	OUTPUTDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),"continuous/output/")
 	# Number of seconds between git queries per thread
-	DELAY = 7
+	DELAY = 8
 	
 	def __init__(self, callback=None, callback_args=None, *args, **kwargs):
 		#target = kwargs.pop('target')
 		target = self.processFile
 		filepath = kwargs.pop('filepath')
 		token = kwargs.pop('token')
-		tagDelimiter = kwargs.pop('tagDelimiter')
+		tag = kwargs.pop('tag')
 		searchAugmentor = kwargs.pop('searchAugmentor')
 		searchParameters = kwargs.pop('searchParameters')
     
@@ -31,7 +40,7 @@ class Inquisitor(threading.Thread):
 		self.token = token
 		self.g = github.Github(self.token)
 		self.callback_args = callback_args
-		self.tagDelimiter = tagDelimiter
+		self.tag = tag
 		self.searchAugmentor = searchAugmentor
 		self.searchParameters = searchParameters
 
@@ -40,8 +49,7 @@ class Inquisitor(threading.Thread):
 		# Log for main script
 		self.logger = logging.getLogger('main')
 		# Log for only hits
-		self.hitslogger = logging.getLogger('hits'+self.tagDelimiter)
-		self.hitslogger.setLevel(logging.DEBUG)
+		self.hitslogger = logging.getLogger('hits'+self.tag)
 		
 	def target_with_callback(self):
 		self.method(self.filepath)
@@ -49,19 +57,32 @@ class Inquisitor(threading.Thread):
 			self.callback(*self.callback_args)
 	
 	def doQuery(self,query):  
-		self.logger.info("Inquisitor.doQuery: '" + query + "'")
-		try:
-			repositories = self.g.search_code(query)
-			numURLs = min(repositories.totalCount,5)
+		self.logger.info("Inquisitor.doQuery: Token=" + self.token[:4] + "... Tag=" + self.tag + " Query='" + query + "'")
+		for attempt in range(10):
+			try:
+				repositories = self.g.search_code(query)
+				numURLs = min(repositories.totalCount,5)
 
+				result = {
+					'totalCount': repositories.totalCount,
+					'query': query,
+					'urls': [repository.html_url for repository in repositories[:numURLs]]
+				}
+				return result
+			except github.RateLimitExceededException:
+				delay = (attempt+1) * Inquisitor.DELAY
+				self.logger.error("Rate Limit Exceeded. Delaying " + str(delay) + " seconds. Query='" + query + "'")
+				print("Rate Limit Exceeded. Delaying " + str(delay) + " seconds. Query='" + query + "'")
+				time.sleep(delay)
+			else: # Query succeeded, break from attempt loop. Should never get here because of return statement.
+				break
+		else: # 10 Attempts all resulted in rate limit exceptions. Give up and return empty.
 			result = {
-				'totalCount': repositories.totalCount,
-				'query': query,
-        'urls': [repository.html_url for repository in repositories[:numURLs]]
-			}
+					'totalCount': 0,
+					'query': query,
+					'urls': []
+				}
 			return result
-		except github.RateLimitExceededException:
-			print("Rate Limit Exceeded on query")
 		
 	def processFile(self,filepath):
 		
@@ -73,21 +94,10 @@ class Inquisitor(threading.Thread):
 			searchParameters = ""
 
 		if(os.path.isfile(filepath)):
-			# If queryfile is in directory beneath ingestor/, make the directory a tag.
-			tag = os.path.dirname(filepath.split(self.tagDelimiter)[-1])[1:]
-			# Remove exception tag: the DO_NOT_AUGMENT folder
-			tag = tag.replace("/DO_NOT_AUGMENT","")
 
-			# Setup logging for hit-only logs
-			outputDir = os.path.join(Inquisitor.OUTPUTDIR, tag)
-			if(not os.path.isdir(outputDir)):
-				os.makedirs(outputDir, exist_ok=True)
-			hitlogfh = logging.FileHandler(os.path.join(outputDir,'hits.json'))
-			hitlogfh.setFormatter(logging.Formatter('{"datetime": "%(asctime)s", "name":"%(name)s", "result": %(message)s}'))
-			
 			with open(filepath, "r") as fp:
 				subqueries = [line.rstrip() for line in fp.readlines()]
-
+				
 				# Check if query terms should be augmented with dirty words
 				if("DO_NOT_AUGMENT" not in filepath):
 					with open(self.searchAugmentor, "r") as sa:
@@ -96,15 +106,13 @@ class Inquisitor(threading.Thread):
 							for searchAugmentor in searchAugmentors:
 								query = subquery + " " + searchAugmentor + " " + searchParameters
 								result = self.doQuery(query)
-								result['tag'] = tag
+								result['tag'] = self.tag
 								
 								# Log results 
 								self.querylogger.info(json.dumps(result))
 								if(result['totalCount'] > 0):
-									self.hitslogger.addHandler(hitlogfh)
 									self.hitslogger.info(json.dumps(result))
-									self.hitslogger.removeHandler(hitlogfh)
-								
+									
 								# Delay between queries
 								time.sleep(Inquisitor.DELAY)
 				
@@ -113,7 +121,7 @@ class Inquisitor(threading.Thread):
 					for subquery in subqueries:
 						query = subquery + " " + searchParameters
 						result = self.doQuery(query)
-						result['tag'] = tag
+						result['tag'] = self.tag
 						
 						# Log results 
 						self.querylogger.info(json.dumps(result))
@@ -128,7 +136,7 @@ class Inquisitor(threading.Thread):
 class InquisitorController():
 	
 	# tagDelimiter is the same as the ingestor folder path. Everything after tagDelimiter, but before filename, is a tag.
-	def __init__(self, tokens=None, maxThreads=None, tagDelimiter=None, searchAugmentor=None, searchParameters=None):
+	def __init__(self, tokens=None, maxThreads=None, tagDelimiter=None, searchAugmentor=None, searchParameters=None, outputDirectory=None):
 		self.threadCount = 0
 		if maxThreads is None:
 			self.maxThreads = len(tokens)
@@ -145,6 +153,7 @@ class InquisitorController():
 		self.tagDelimiter = tagDelimiter
 		self.searchAugmentor = searchAugmentor
 		self.searchParameters = searchParameters
+		self.outputDirectory = outputDirectory
 		self.logger = logging.getLogger('main')
 
 	def enqueue(self, filepath):
@@ -154,20 +163,39 @@ class InquisitorController():
 	def process(self):
 		if len(self.queue) > 0 and self.threadCount < self.maxThreads:
 			fileToProcess = self.queue.pop(0)
-			self.threadCount += 1
 			print("processing "+fileToProcess)
+			self.logger.info("InquisitorController.process: Processing: " + fileToProcess)
+			
+			# If queryfile is in directory beneath ingestor/, make the directory a tag.
+			tag = os.path.dirname(fileToProcess.split(self.tagDelimiter)[-1])[1:]
+			# Remove exception tag: the DO_NOT_AUGMENT folder
+			tag = tag.replace("/DO_NOT_AUGMENT","")
+			
+			# Setup logging for hit-only logs
+			hitslogger = logging.getLogger('hits'+tag)
+			# Only add handler once. Skip if it already exists.
+			if(not len(hitslogger.handlers)):
+				outputDir = os.path.join(self.outputDirectory, tag)
+				if(not os.path.isdir(outputDir)):
+					os.makedirs(outputDir, exist_ok=True)
+				hitlogfh = logging.FileHandler(os.path.join(outputDir,'hits.json'))
+				hitlogfh.setFormatter(logging.Formatter('{"datetime": "%(asctime)s", "name":"%(name)s", "result": %(message)s}'))
+				hitslogger.setLevel(logging.DEBUG)
+				hitslogger.addHandler(hitlogfh)
+
+		
 			thread = Inquisitor(
 				name='inquisitor',
 				callback=self.dequeue,
 				callback_args=[fileToProcess],
 				filepath=fileToProcess,
 				token=self.tokens[self.currentTokenIndex],
-				tagDelimiter=self.tagDelimiter,
+				tag=tag,
 				searchAugmentor=self.searchAugmentor,
 				searchParameters=self.searchParameters
 			)
 			thread.start()
-			self.logger.info("InquisitorController.process: Processing: " + fileToProcess)
+			self.threadCount += 1
 			self.logger.info("InquisitorController.process: Current running threads: " + str(self.threadCount))
 			
 			# Increment to next token (round-robin)
@@ -190,19 +218,25 @@ class InquisitorController():
 # Not using python watchdog as the Thread-calling mechanism above required object-passing to keep things synchronized.
 # This is simpler: a single loop.
 def main():
-	PATH_TO_WATCH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "continuous/ingester")
-	TOKENFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),"tokenfile")
-	SEARCH_AUGMENTOR = os.path.join(os.path.dirname(os.path.abspath(__file__)),"continuous/search_augmentor")
-	SEARCH_PARAMETERS = os.path.join(os.path.dirname(os.path.abspath(__file__)),"continuous/search_parameters")
-	LOGFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),"continuous/logs/out.log")
-	QUERYLOGFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),"continuous/logs/queries.log")
-	tokens = []
+
+	# Set working directory to the script's directory:
+	working_dir = os.path.abspath(os.path.dirname(os.path.abspath(__file__)))
+
+	# Parse configuration file
+	config = yaml.safe_load(open(os.path.join(working_dir,"config/config.yml")))
+	PATH_TO_WATCH = config['input_directory']
+	TOKENFILE = config["token_file"]
+	SEARCH_AUGMENTOR = config["search_augmentor_file"]
+	SEARCH_PARAMETERS = config["search_parameters_file"]
+	LOGFILE = config["log_file"]
+	QUERYLOGFILE = config["querylog_file"]
+	OUTPUTDIR = config['output_directory']
 	
 	# Setup Logging
 	mainLogFormatter = logging.Formatter('%(asctime)s: %(message)s')
 	queryLogFormatter = logging.Formatter('{"datetime": "%(asctime)s", "name":"%(name)s", "result": %(message)s}')
 
-	# Log for queriesy
+	# Log for queries
 	querylogfh = logging.FileHandler(QUERYLOGFILE)
 	querylogfh.setFormatter(queryLogFormatter)
 	querylogger = logging.getLogger('queryLog')
@@ -215,18 +249,22 @@ def main():
 	logger = logging.getLogger('main')
 	logger.setLevel(logging.DEBUG)
 	logger.addHandler(logfh)
+	logger.info("Starting Inquisitor.")
 
 	# Parse tokens
+	tokens = []
 	with open(TOKENFILE, "r") as fp:
 		tokens = [line.rstrip() for line in fp.readlines()]
+	logger.info("Parsed " + str(len(tokens)) + " GitHub tokens.")
 
 	# Create thread controller
 	controller = InquisitorController(
-    tokens=tokens, 
-    tagDelimiter=PATH_TO_WATCH, 
-    searchAugmentor=SEARCH_AUGMENTOR,
-    searchParameters=SEARCH_PARAMETERS
-  )
+	tokens=tokens, 
+	tagDelimiter=PATH_TO_WATCH, 
+	searchAugmentor=SEARCH_AUGMENTOR,
+	searchParameters=SEARCH_PARAMETERS,
+	outputDirectory=OUTPUTDIR
+	)
 	
 	# Ingest existing files (every file in PATH_TO_WATCH recursively)
 	filesToIngest = [os.path.join(dp, f) for dp, dn, fn in os.walk(os.path.join(os.getcwd(),PATH_TO_WATCH)) for f in fn]
@@ -260,7 +298,7 @@ def main():
 			controller.process()
 			
 	except KeyboardInterrupt:
-		pass
+		logger.info("Caught keyboard interrupt.")
 
 
 if __name__ == "__main__":

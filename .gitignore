@@ -1,4 +1,5 @@
 env
+.env
 states
 tokenfile
 checks/*.list

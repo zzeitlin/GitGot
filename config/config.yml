@@ -1,0 +1,7 @@
+input_directory: input
+output_directory: output
+token_file: config/tokenfile
+search_augmentor_file: config/search_augmentor
+search_parameters_file: config/search_parameters
+log_file: logs/out.log
+querylog_file: logs/queries.log
