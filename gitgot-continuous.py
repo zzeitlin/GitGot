@@ -49,7 +49,7 @@ class Inquisitor(threading.Thread):
 			self.callback(*self.callback_args)
 	
 	def doQuery(self,query):  
-		self.logger.info("Inquisitor.doQuery: \"" + query + "\"")
+		self.logger.info("Inquisitor.doQuery: '" + query + "'")
 		try:
 			repositories = self.g.search_code(query)
 			numURLs = min(repositories.totalCount,5)
