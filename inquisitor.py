@@ -19,8 +19,6 @@ import yaml
 
 # This thread takes in a file as input, and processes it.
 class Inquisitor(threading.Thread):
-	# Where to store logging information
-	OUTPUTDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),"continuous/output/")
 	# Number of seconds between git queries per thread
 	DELAY = 8
 	
@@ -43,6 +41,7 @@ class Inquisitor(threading.Thread):
 		self.tag = tag
 		self.searchAugmentor = searchAugmentor
 		self.searchParameters = searchParameters
+		self.shutdown_flag = threading.Event() # Event that stops this thread cleanly
 
 		# Log for every query
 		self.querylogger = logging.getLogger('queryLog')
@@ -98,38 +97,48 @@ class Inquisitor(threading.Thread):
 			with open(filepath, "r") as fp:
 				subqueries = [line.rstrip() for line in fp.readlines()]
 				
-				# Check if query terms should be augmented with dirty words
-				if("DO_NOT_AUGMENT" not in filepath):
-					with open(self.searchAugmentor, "r") as sa:
-						searchAugmentors = [line.rstrip() for line in sa.readlines()]
-						for subquery in subqueries:
-							for searchAugmentor in searchAugmentors:
-								query = subquery + " " + searchAugmentor + " " + searchParameters
-								result = self.doQuery(query)
-								result['tag'] = self.tag
-								
-								# Log results 
-								self.querylogger.info(json.dumps(result))
-								if(result['totalCount'] > 0):
-									self.hitslogger.info(json.dumps(result))
-									
-								# Delay between queries
-								time.sleep(Inquisitor.DELAY)
-				
-				# Do not augment:
-				else:
+			# Check if query terms should be augmented with dirty words
+			if("DO_NOT_AUGMENT" not in filepath):
+				with open(self.searchAugmentor, "r") as sa:
+					searchAugmentors = [line.rstrip() for line in sa.readlines()]
 					for subquery in subqueries:
-						query = subquery + " " + searchParameters
-						result = self.doQuery(query)
-						result['tag'] = self.tag
-						
-						# Log results 
-						self.querylogger.info(json.dumps(result))
-						if(result['totalCount'] > 0):
-							self.hitslogger.info(json.dumps(result))
+						for searchAugmentor in searchAugmentors:
+							query = subquery + " " + searchAugmentor + " " + searchParameters
+							result = self.doQuery(query)
+							result['tag'] = self.tag
 							
-						# Delay between queries
-						time.sleep(Inquisitor.DELAY)
+							# Log results 
+							self.querylogger.info(json.dumps(result))
+							if(result['totalCount'] > 0):
+								self.hitslogger.info(json.dumps(result))
+								
+							# Delay between queries
+							time.sleep(Inquisitor.DELAY)
+
+							# Check shutdown signal
+							if(self.shutdown_flag.is_set()):
+								break
+						if(self.shutdown_flag.is_set()):
+							break
+			
+			# Do not augment:
+			else:
+				for subquery in subqueries:
+					query = subquery + " " + searchParameters
+					result = self.doQuery(query)
+					result['tag'] = self.tag
+					
+					# Log results 
+					self.querylogger.info(json.dumps(result))
+					if(result['totalCount'] > 0):
+						self.hitslogger.info(json.dumps(result))
+						
+					# Delay between queries
+					time.sleep(Inquisitor.DELAY)
+
+					# Check shutdown signal
+					if(self.shutdown_flag.is_set()):
+						break
 							
 
 
@@ -149,6 +158,9 @@ class InquisitorController():
 
 		# A list of file paths
 		self.queue = []
+
+		# A list of threads
+		self.threads = []
 		
 		self.tagDelimiter = tagDelimiter
 		self.searchAugmentor = searchAugmentor
@@ -161,7 +173,7 @@ class InquisitorController():
 		self.logger.info("InquisitorController.enqueue: Adding to file queue: " + filepath)
 		
 	def process(self):
-		if len(self.queue) > 0 and self.threadCount < self.maxThreads:
+		if len(self.queue) > 0 and len(self.threads) < self.maxThreads:
 			fileToProcess = self.queue.pop(0)
 			print("processing "+fileToProcess)
 			self.logger.info("InquisitorController.process: Processing: " + fileToProcess)
@@ -179,11 +191,10 @@ class InquisitorController():
 				if(not os.path.isdir(outputDir)):
 					os.makedirs(outputDir, exist_ok=True)
 				hitlogfh = logging.FileHandler(os.path.join(outputDir,'hits.json'))
-				hitlogfh.setFormatter(logging.Formatter('{"datetime": "%(asctime)s", "name":"%(name)s", "result": %(message)s}'))
+				hitlogfh.setFormatter(logging.Formatter('{"datetime": "%(asctime)s", "result": %(message)s}'))
 				hitslogger.setLevel(logging.DEBUG)
 				hitslogger.addHandler(hitlogfh)
-
-		
+				
 			thread = Inquisitor(
 				name='inquisitor',
 				callback=self.dequeue,
@@ -195,24 +206,34 @@ class InquisitorController():
 				searchParameters=self.searchParameters
 			)
 			thread.start()
-			self.threadCount += 1
-			self.logger.info("InquisitorController.process: Current running threads: " + str(self.threadCount))
+			self.threads.append(thread)
+			self.logger.info("InquisitorController.process: Current running threads: " + str(len(self.threads)))
 			
 			# Increment to next token (round-robin)
 			self.currentTokenIndex = (self.currentTokenIndex + 1) % len(self.tokens)
 			
 	def dequeue(self, filepath):
-		print("dequeue called: "+str(filepath))
-		self.logger.info("InquisitorController.dequeue: Removing from file queue: " + filepath)
-		# Remove from queue
+		# Scenario A: This can be called as a callback to a thread ending, or
+		# Scenario B: This can be called after an input file is abruptly deleted
+
+		# Remove from queue. Should already be popped() from queue, but this solves a potential race condition.
 		while filepath in self.queue:
+			self.logger.info("InquisitorController.dequeue: Removing from file queue: " + filepath)
 			self.queue.remove(filepath)
 		
-		# Decrement number of threads
-		self.threadCount -= 1
-		
+		# Shutdown thread. Even at callback, thread.isAlive() is true.
+		# Covers Scenario B
+		for thread in self.threads:
+			if(thread.filepath == filepath):
+				self.logger.info("InquisitorController.dequeue: Stopping thread for: " + filepath)
+				thread.shutdown_flag.set()
+				self.threads.remove(thread)
+
 		# Delete file
-		os.remove(filepath)
+		# Covers Scenario A
+		if(os.path.isfile(filepath)):
+			self.logger.info("InquisitorController.dequeue: Deleting from filesystem: " + filepath)
+			os.remove(filepath)
 
 
 # Not using python watchdog as the Thread-calling mechanism above required object-passing to keep things synchronized.
@@ -234,7 +255,7 @@ def main():
 	
 	# Setup Logging
 	mainLogFormatter = logging.Formatter('%(asctime)s: %(message)s')
-	queryLogFormatter = logging.Formatter('{"datetime": "%(asctime)s", "name":"%(name)s", "result": %(message)s}')
+	queryLogFormatter = logging.Formatter('{"datetime": "%(asctime)s", "result": %(message)s}')
 
 	# Log for queries
 	querylogfh = logging.FileHandler(QUERYLOGFILE)
@@ -287,11 +308,12 @@ def main():
 			if added:
 				logger.info("Directory monitor observed files created: " + ", ".join(added))
 				for f in added:
-					filepath = os.path.join(PATH_TO_WATCH,f)
-					if(os.path.isfile(filepath)):
-						controller.enqueue(filepath)
+					if(os.path.isfile(f)):
+						controller.enqueue(f)
 			if removed: 
 				logger.info("Directory monitor observed files deleted: " + ", ".join(removed))
+				for f in removed:
+					controller.dequeue(f)
 			before = after
 			
 			# Process the queue
