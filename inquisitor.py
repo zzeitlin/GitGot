@@ -4,12 +4,10 @@
 Author:		Zachary Zeitlin
 Purpose:	Continuously query GitHub for sensitive data and output search results.
 Notes:      - This file takes input from other relative filepaths, listed below.
-						- To use fireprox, export 'http_proxy'
+						- To use fireprox, modify the config.yml with the generated AWS URL
+						- ./fire.py --profile_name fireprox --command create --url https://api.github.com/
 Usage:      ./gitgot-continuous.py
-TODO:		- Include fireprox argument to proxy connection. g = Github(base_url="https://github.company.com/api/v3")
-				https://github.com/PyGithub/PyGithub/issues/172#issuecomment-19393127
-				https://github.com/PyGithub/PyGithub/pull/309
-				https://github.com/beugley/PyGithub/blob/master/github/Requester.py#L325
+TODO:		- In
 				first 333 million api calls are $3.50 per million.
 '''
 
