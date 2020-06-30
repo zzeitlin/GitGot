@@ -5,3 +5,9 @@ search_augmentor_file: config/search_augmentor
 search_parameters_file: config/search_parameters
 log_file: logs/out.log
 querylog_file: logs/queries.log
+
+# Delay in seconds between successive queries per thread.
+query_delay: 1
+
+# If using fireprox (AWS Gateway API), put base_url here. Defaults to https://api.github.com/
+#base_url: https://sqijn2ap3a.execute-api.us-east-1.amazonaws.com/fireprox/

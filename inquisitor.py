@@ -4,7 +4,13 @@
 Author:		Zachary Zeitlin
 Purpose:	Continuously query GitHub for sensitive data and output search results.
 Notes:      - This file takes input from other relative filepaths, listed below.
+						- To use fireprox, export 'http_proxy'
 Usage:      ./gitgot-continuous.py
+TODO:		- Include fireprox argument to proxy connection. g = Github(base_url="https://github.company.com/api/v3")
+				https://github.com/PyGithub/PyGithub/issues/172#issuecomment-19393127
+				https://github.com/PyGithub/PyGithub/pull/309
+				https://github.com/beugley/PyGithub/blob/master/github/Requester.py#L325
+				first 333 million api calls are $3.50 per million.
 '''
 
 import github
@@ -15,28 +21,35 @@ import threading
 import os
 import json
 import yaml
-
+import queue
 
 # This thread takes in a file as input, and processes it.
 class Inquisitor(threading.Thread):
-	# Number of seconds between git queries per thread
-	DELAY = 8
-	
+
 	def __init__(self, callback=None, callback_args=None, *args, **kwargs):
 		#target = kwargs.pop('target')
 		target = self.processFile
 		filepath = kwargs.pop('filepath')
-		token = kwargs.pop('token')
+		tokenQueue = kwargs.pop('tokenQueue')
 		tag = kwargs.pop('tag')
 		searchAugmentor = kwargs.pop('searchAugmentor')
 		searchParameters = kwargs.pop('searchParameters')
-    
+		baseURL = kwargs.pop('baseURL')
+		queryDelay = kwargs.pop('queryDelay')    
+
 		super(Inquisitor, self).__init__(target=self.target_with_callback, *args, **kwargs)
 		self.callback = callback
 		self.method = target
 		self.filepath = filepath
-		self.token = token
-		self.g = github.Github(self.token)
+		self.tokenQueue = tokenQueue
+		self.baseURL = baseURL
+		self.queryDelay = queryDelay
+		
+		# Apply token, and re-insert into token queue
+		self.token = self.tokenQueue.get()
+		self.g = github.Github(self.token, base_url=self.baseURL)
+		#self.g = github.Github(self.token)
+		
 		self.callback_args = callback_args
 		self.tag = tag
 		self.searchAugmentor = searchAugmentor
@@ -69,10 +82,21 @@ class Inquisitor(threading.Thread):
 				}
 				return result
 			except github.RateLimitExceededException:
-				delay = (attempt+1) * Inquisitor.DELAY
-				self.logger.error("Rate Limit Exceeded. Delaying " + str(delay) + " seconds. Query='" + query + "'")
-				print("Rate Limit Exceeded. Delaying " + str(delay) + " seconds. Query='" + query + "'")
-				time.sleep(delay)
+				#delay = (attempt+1) * Inquisitor.DELAY
+				#self.logger.error("Rate Limit Exceeded. Delaying " + str(delay) + " seconds. Query='" + query + "'")
+				#print("Rate Limit Exceeded. Delaying " + str(delay) + " seconds. Query='" + query + "'")
+				#time.sleep(delay)
+
+				# Rotate tokens
+				oldToken = self.token
+				self.tokenQueue.put(self.token)
+				self.token = self.tokenQueue.get()
+				self.logger.error("Rate Limit Exceeded. Rotating from token " + oldToken[:4] + "... to token " + self.token[:4] + "...")
+
+				# Apply token
+				self.g = github.Github(self.token, base_url=self.baseURL)
+				print("Rate Limit Exceeded. Rotating from token " + oldToken[:4] + "... to token " + self.token[:4] + "...")
+				time.sleep(self.queryDelay)
 			else: # Query succeeded, break from attempt loop. Should never get here because of return statement.
 				break
 		else: # 10 Attempts all resulted in rate limit exceptions. Give up and return empty.
@@ -113,7 +137,7 @@ class Inquisitor(threading.Thread):
 								self.hitslogger.info(json.dumps(result))
 								
 							# Delay between queries
-							time.sleep(Inquisitor.DELAY)
+							time.sleep(self.queryDelay)
 
 							# Check shutdown signal
 							if(self.shutdown_flag.is_set()):
@@ -134,7 +158,7 @@ class Inquisitor(threading.Thread):
 						self.hitslogger.info(json.dumps(result))
 						
 					# Delay between queries
-					time.sleep(Inquisitor.DELAY)
+					time.sleep(self.queryDelay)
 
 					# Check shutdown signal
 					if(self.shutdown_flag.is_set()):
@@ -145,17 +169,17 @@ class Inquisitor(threading.Thread):
 class InquisitorController():
 	
 	# tagDelimiter is the same as the ingestor folder path. Everything after tagDelimiter, but before filename, is a tag.
-	def __init__(self, tokens=None, maxThreads=None, tagDelimiter=None, searchAugmentor=None, searchParameters=None, outputDirectory=None):
+	def __init__(self, tokenQueue=None, maxThreads=None, tagDelimiter=None, searchAugmentor=None, searchParameters=None, outputDirectory=None, baseURL=None, queryDelay=None):
+
+		# A list of GitHub auth token strings
+		self.tokenQueue = tokenQueue
+
 		self.threadCount = 0
 		if maxThreads is None:
-			self.maxThreads = len(tokens)
+			self.maxThreads = self.tokenQueue.qsize()
 		else:
 			self.maxThreads = maxThreads
 		
-		# A list of GitHub auth token strings
-		self.tokens = tokens
-		self.currentTokenIndex = 0
-
 		# A list of file paths
 		self.queue = []
 
@@ -166,6 +190,8 @@ class InquisitorController():
 		self.searchAugmentor = searchAugmentor
 		self.searchParameters = searchParameters
 		self.outputDirectory = outputDirectory
+		self.baseURL = baseURL
+		self.queryDelay = queryDelay
 		self.logger = logging.getLogger('main')
 
 	def enqueue(self, filepath):
@@ -200,17 +226,17 @@ class InquisitorController():
 				callback=self.dequeue,
 				callback_args=[fileToProcess],
 				filepath=fileToProcess,
-				token=self.tokens[self.currentTokenIndex],
+				tokenQueue=self.tokenQueue,
 				tag=tag,
 				searchAugmentor=self.searchAugmentor,
-				searchParameters=self.searchParameters
+				searchParameters=self.searchParameters,
+				queryDelay = self.queryDelay,
+				baseURL = self.baseURL
 			)
 			thread.start()
 			self.threads.append(thread)
 			self.logger.info("InquisitorController.process: Current running threads: " + str(len(self.threads)))
 			
-			# Increment to next token (round-robin)
-			self.currentTokenIndex = (self.currentTokenIndex + 1) % len(self.tokens)
 			
 	def dequeue(self, filepath):
 		# Scenario A: This can be called as a callback to a thread ending, or
@@ -252,7 +278,12 @@ def main():
 	LOGFILE = config["log_file"]
 	QUERYLOGFILE = config["querylog_file"]
 	OUTPUTDIR = config['output_directory']
-	
+	if('base_url' in config):
+		BASE_URL = config['base_url']
+	else:
+		BASE_URL = 'https://api.github.com'
+	QUERY_DELAY = config['query_delay']
+
 	# Setup Logging
 	mainLogFormatter = logging.Formatter('%(asctime)s: %(message)s')
 	queryLogFormatter = logging.Formatter('{"datetime": "%(asctime)s", "result": %(message)s}')
@@ -273,18 +304,21 @@ def main():
 	logger.info("Starting Inquisitor.")
 
 	# Parse tokens
-	tokens = []
+	tokenQueue = queue.Queue()
 	with open(TOKENFILE, "r") as fp:
-		tokens = [line.rstrip() for line in fp.readlines()]
-	logger.info("Parsed " + str(len(tokens)) + " GitHub tokens.")
+		for line in fp.readlines():
+			tokenQueue.put(line.rstrip())
+	logger.info("Parsed " + str(tokenQueue.qsize()) + " GitHub tokens.")
 
 	# Create thread controller
 	controller = InquisitorController(
-	tokens=tokens, 
+	tokenQueue=tokenQueue, 
 	tagDelimiter=PATH_TO_WATCH, 
 	searchAugmentor=SEARCH_AUGMENTOR,
 	searchParameters=SEARCH_PARAMETERS,
-	outputDirectory=OUTPUTDIR
+	outputDirectory=OUTPUTDIR,
+	baseURL=BASE_URL,
+	queryDelay=QUERY_DELAY
 	)
 	
 	# Ingest existing files (every file in PATH_TO_WATCH recursively)
